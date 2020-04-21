@@ -1,2 +1,5 @@
 week2/cifar10
 *data*
+*.pt
+*.pth
+*.npy
