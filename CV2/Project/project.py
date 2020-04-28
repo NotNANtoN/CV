@@ -153,11 +153,8 @@ class FixationDataset(Dataset):
 class Rescale():
     def __init__(self):
         pass
-        
     def __call__(self, sample):
         return sample.astype(float) / 255.0
-    
-    
         for key in sample:
             sample[key] = sample[key].astype(float) / 255.0
         return sample
@@ -195,7 +192,9 @@ def save(epoch, model, opt, loss, path):
                 "loss": loss
                 }, path)
             
-normalize = torchvision.transforms.Normalize(mean=[0.485 , 0.456 , 0.406], std=[0.229 , 0.224 , 0.225])
+means = torch.tensor([0.485 , 0.456 , 0.406])
+stds = torch.tensor([0.229 , 0.224 , 0.225])
+normalize = torchvision.transforms.Normalize(mean=means, std=stds)
 input_transform = torchvision.transforms.Compose([Rescale(), ToTensor(), normalize])
 target_transform = torchvision.transforms.Compose([Rescale(), ToTensor()])
 
@@ -231,7 +230,7 @@ use_apex = True
 if use_apex:
     model, optimizer = amp.initialize(model, opt, opt_level="O1")
 
-epochs = 5
+epochs = 20
 pbar = tqdm(total=epochs * len(train_dl))
 best_loss = None
 for epoch in range(epochs):
@@ -264,12 +263,30 @@ for epoch in range(epochs):
         
         # Save images:
         def stack_img_pred_and_fix(sample):
-            img = sample["image"]
+            use_means = means.view(1, 3, 1, 1)
+            use_stds = stds.view(1, 3, 1, 1)
+            img = sample["image"].mul_(use_stds).add_(use_means) #* 255
+            #img = ((sample["image"] * stds) + means) * 255
             pred = model(img.to(device)).cpu()
-            gray_img = img.mean(dim=1).unsqueeze(1)
+            # turn to 3 channel:
+            pred = torch.cat([pred] * 3, dim=1)
             fix = sample["fixation"]
+            fix = torch.cat([fix] * 3, dim=1)
+            
+            
+            #img = sample["image"]
+            #pred = model(img.to(device)).cpu()
+            gray_img = img.mean(dim=1).unsqueeze(1)
+            #fix = sample["fixation"]
+            
             #print(img.shape, pred.shape, gray_img.shape, fix.shape)
-            return torch.cat([gray_img, pred, fix])
+            #return torch.cat([gray_img, pred, fix], dim=1)
+            shp = pred.shape
+            mod_shp = list(shp)
+            mod_shp[0] *= 3
+            stacked = torch.stack([img, pred, fix], dim=1)
+            #print(stacked.shape)
+            return stacked.view(mod_shp)
         imgs = torch.cat([stack_img_pred_and_fix(sample) for sample in val_dl])
         torchvision.utils.save_image(imgs[:100], "imgs/" + str(epoch) + "_val_preds.png", nrow=9)
     
