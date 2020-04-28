@@ -3,3 +3,5 @@ week2/cifar10
 *.pt
 *.pth
 *.npy
+.ipynb_checkpoints
+CV2/Project/imgs/
