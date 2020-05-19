@@ -1,4 +1,5 @@
 import os
+import random
 
 from tqdm import tqdm
 import numpy as np
@@ -8,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, Dataset
 import torchvision
+from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 #import torchvision.models as models
@@ -27,7 +29,6 @@ class Encoder(nn.Module):
         
         if self.net == "res":
             self.feature_extractor = torchvision.models.resnet50(pretrained=pretrained)
-            print(self.feature_extractor)
             self.feature_extractor.avgpool = Identity()
             self.feature_extractor.fc = Identity()
         elif self.net == "vgg":
@@ -66,8 +67,7 @@ class Decoder(nn.Module):
         
         in_channels, size = input_shp 
         
-        #TODO: try upsample = nn.ConvTranspose2d(16, 16, 3, stride=2, padding=1 instead of Upsample
-        mode = "conv" # "bilinear", "conv"
+        mode = "bilinear" # "bilinear", "conv"
         
         def create_upsampling(mode, channels):
             if mode == "bilinear":
@@ -105,9 +105,9 @@ class Decoder(nn.Module):
                                nn.ReLU(),
                                create_upsampling(mode, 128)
                               )
-        block5 = nn.Sequential(nn.Conv2d(128, 512, 3, padding=1), 
+        block5 = nn.Sequential(nn.Conv2d(128, 64, 3, padding=1), 
                                nn.ReLU(),
-                               nn.Conv2d(512, 1, 3, padding=1), 
+                               nn.Conv2d(64, 1, 3, padding=1), 
                                #nn.Sigmoid()
                               )
         self.generator = nn.Sequential(block1, block2, block3, block4, block5)
@@ -151,13 +151,18 @@ def read_file(filename):
 
 
 class FixationDataset(Dataset):
-    def __init__(self, root_dir, image_file, fixation_file, input_transform=None, target_transform=None):
+    def __init__(self, root_dir, image_file, fixation_file, input_transform=None, target_transform=None, train_transform=None, train_input_transform=None):
         self.root_dir = root_dir
         self.image_files = read_file(os.path.join(root_dir, image_file))
-        self.fixation_files = read_file(os.path.join(root_dir, fixation_file))
+        if fixation_file is not None:
+            self.fixation_files = read_file(os.path.join(root_dir, fixation_file))
+            assert(len(self.image_files) == len(self.fixation_files))
+        else:
+            self.fixation_files = None
         self.input_transform = input_transform
         self.target_transform = target_transform
-        assert(len(self.image_files) == len(self.fixation_files))
+        self.train_transform = train_transform
+        self.train_input_transform = train_input_transform
 
     def __len__(self):
         return len(self.image_files)
@@ -165,21 +170,34 @@ class FixationDataset(Dataset):
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-
+            
+        # Read input img:
         img_name = os.path.join(self.root_dir, self.image_files[idx])
         image = imageio.imread(img_name)
+
+        # Read target img:
+        sample = {'image': image}
+        if self.fixation_files is not None:
+            fix_name = os.path.join(self.root_dir, self.fixation_files[idx])
+            fix = imageio.imread(fix_name)
+            sample['fixation'] = fix
+            
+        # Apply transforms:
+        seed = np.random.randint(2147483647) # make a seed with numpy generator 
+        if self.train_transform:
+            # Set random seed to same val to have same transform for input and target:
+            random.seed(seed)
+            sample["image"] = self.train_transform(sample["image"])
+            random.seed(seed)
+            sample["fixation"] = self.train_transform(sample["fixation"])
+        if self.train_input_transform:
+            sample["image"] = self.train_input_transform(sample["image"])
         if self.input_transform:
-            image = self.input_transform(image)
-
-        fix_name = os.path.join(self.root_dir, self.fixation_files[idx])
-        fix = imageio.imread(fix_name)
-        if self.input_transform:
-            fix = self.target_transform(fix)
-
-        sample = {'image': image, 'fixation': fix}
-
-        #if self.transform:
-        #	sample = self.transform(sample)
+            sample["image"] = self.input_transform(sample["image"])
+        if self.fixation_files is not None and self.target_transform:
+            sample["fixation"] = self.target_transform(sample["fixation"])
+            
+        sample["img_name"] = img_name
         return sample
 		
 class Rescale():
@@ -227,17 +245,22 @@ def save(epoch, model, opt, loss, path):
 def stack_img_pred_and_fix(imgs, targets, preds, loss_type):
     use_means = means.view(1, 3, 1, 1)
     use_stds = stds.view(1, 3, 1, 1)
-    imgs = imgs.mul_(use_stds).add_(use_means) #* 255
-    if "BCE" in loss_type:
-        preds = torch.sigmoid(preds)
+    imgs = imgs.mul_(use_stds).add_(use_means)
+    #if "BCE" in loss_type:
+    #    preds = torch.sigmoid(preds)
     # turn to 3 channels:
     preds = torch.cat([preds] * 3, dim=1)
-    targets = torch.cat([targets] * 3, dim=1)
+    if targets is not None:
+        targets = torch.cat([targets] * 3, dim=1)
+        stack_list = [imgs, targets, preds]
+    else:
+        stack_list = [imgs, preds]
+        
     # calc new shape:
     shp = list(preds.shape)
-    shp[0] *= 3
+    shp[0] *= len(stack_list)
     # stack:
-    stacked = torch.stack([imgs, targets, preds], dim=1)
+    stacked = torch.stack(stack_list, dim=1)
     # reshape and return:
     return stacked.view(shp)
 
@@ -251,15 +274,18 @@ def pearson_loss(preds, targets):
     #cost = vx * vy * torch.rsqrt(torch.sum(vx ** 2)) * torch.rsqrt(torch.sum(vy ** 2)))
     return (-1 * cost) + 1
             
+# Create transforms:
 means = torch.tensor([0.485 , 0.456 , 0.406])
 stds = torch.tensor([0.229 , 0.224 , 0.225])
-normalize = torchvision.transforms.Normalize(mean=means, std=stds)
-input_transform = torchvision.transforms.Compose([Rescale(), ToTensor(), normalize])
-target_transform = torchvision.transforms.Compose([Rescale(), ToTensor()])
-
-# TODO: add data augmentation transforms: https://pytorch.org/docs/stable/torchvision/transforms.html
-ds = FixationDataset("data", "train_images.txt", "train_fixations.txt", input_transform, target_transform)      
-val_ds = FixationDataset("data", "val_images.txt", "val_fixations.txt", input_transform, target_transform)        
+normalize = transforms.Normalize(mean=means, std=stds)
+input_transform = transforms.Compose([transforms.ToTensor(), normalize])
+target_transform = transforms.Compose([transforms.ToTensor()])
+train_transform = transforms.Compose([transforms.ToPILImage(), transforms.RandomHorizontalFlip(p=0.5), transforms.RandomRotation(5, resample=False, expand=False, center=None, fill=None)])
+train_input_transform = transforms.Compose([transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1)])#, torchvision.transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0, inplace=False)])
+# Create datasets:
+ds = FixationDataset("data", "train_images.txt", "train_fixations.txt", input_transform, target_transform, train_transform, train_input_transform)      
+val_ds = FixationDataset("data", "val_images.txt", "val_fixations.txt", input_transform, target_transform)  
+test_ds = FixationDataset("data", "test_images.txt", None, input_transform, None)  
 
 sampler = RandomSampler(ds)
 torch.backends.cudnn.benchmark = True
@@ -268,35 +294,53 @@ train_batch_size = 16
 val_batch_size = 9
 train_dl = DataLoader(ds, batch_size=train_batch_size, num_workers=2, pin_memory=pin_mem, sampler=sampler)
 val_dl = DataLoader(val_ds, batch_size=val_batch_size, num_workers=2, pin_memory=pin_mem)
+test_dl = DataLoader(test_ds, batch_size=val_batch_size, num_workers=2, pin_memory=pin_mem)
 
-net_type = "vgg"  # "res", "vgg"
+net_type = "res"  # "res", "vgg"
 freeze = "none" # "all", "N", "none"
-lr = 0.00003
+lr = 0.0003
+epochs = 50
+loss_type = "BCEDown"
+mse_alpha = 1.1
+
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = EncoderDecoder(net_type, freeze)
 model.to(device)
 opt = torch.optim.Adam(model.parameters(), lr=lr)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.1, patience=3, verbose=True, threshold=0.0001, threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08)
-loss_type = "BCE+MSE"
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.1, patience=1, verbose=True, threshold=0.0001, threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08)
 bce_fcn = torch.nn.BCEWithLogitsLoss() 
 kl_div_func = torch.nn.KLDivLoss()
 kl_div = lambda preds, targets: kl_div_func(torch.log(preds / preds.sum()), targets / targets.sum())
 mse_fcn = torch.nn.MSELoss()
+mse_unreduced = torch.nn.MSELoss(reduce="none")
+def weighted_mse(x, y):
+    losses = mse_unreduced(x, y)
+    weights = (mse_alpha - y) ** 2
+    return (losses / weights).mean() 
 bce_down_fcn = BCELossDownsampling()
 if loss_type == "BCEDown":
     loss_fcn = bce_down_fcn
 elif loss_type == "BCE":
     loss_fcn = bce_fcn
 elif loss_type == "MSE":
-    loss_fcn = mse_fcn
+    loss_fcn = lambda x, y: mse_fcn(torch.sigmoid(x), y)
 elif loss_type == "KL":
-    loss_fcn = kl_div
+    loss_fcn = lambda x, y: kl_div(torch.sigmoid(x), y)
 elif loss_type == "pearson":
-    loss_fcn = pearson_loss
+    loss_fcn = lambda x, y: pearson_loss(torch.sigmoid(x), y)
 elif loss_type == "KL+pearson":
-    loss_fcn = lambda x, y: pearson_loss(x, y) + kl_div(x, y)
+    loss_fcn = lambda x, y: pearson_loss(torch.sigmoid(x), y) + kl_div(torch.sigmoid(x), y)
 elif loss_type == "BCE+MSE":
     loss_fcn = lambda x, y: bce_down_fcn(x, y) + mse_fcn(torch.sigmoid(x), y)
+elif loss_type == "WeightedMSE":
+    loss_fcn = lambda x, y: weighted_mse(torch.sigmoid(x), y)
+    
+test = torch.tensor([[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]])
+#print(loss_type, "pred for same x and y of: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]", loss_fcn(test, test))
+#print(loss_type, "pred for x and 1 - x of: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]", loss_fcn(test, 1 - test))
+#print(loss_type, "pred for x=0 and y is: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]", loss_fcn(test, torch.zeros_like(test)))
+#print(loss_type, "pred for x=1 and y: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]", loss_fcn(test, torch.ones_like(test)))
 
 os.makedirs("imgs", exist_ok=True)
 
@@ -305,12 +349,10 @@ if use_apex:
     model, optimizer = amp.initialize(model, opt, opt_level="O1")
 
 writer = SummaryWriter(comment=loss_type + net_type + "freeze" + freeze + str(train_batch_size) + "_" + str(lr))
-epochs = 20
 pbar = tqdm(total=epochs * len(train_dl))
 best_loss = None
-for epoch in range(epochs):
-    
-                
+loss_dict = {"val": [], "train": []}
+for epoch in range(epochs):     
     # Eval:
     model.eval()
     inputs = []
@@ -333,7 +375,9 @@ for epoch in range(epochs):
     val_bce = bce_fcn(preds, targets).item()
     val_bce_down = bce_down_fcn(preds, targets).item()
     val_loss = loss_fcn(preds, targets).item()
-    preds = torch.sigmoid(preds)
+    #print(preds.mean().item(), preds.std().item(), preds.min().item(), preds.max().item())
+    if "BCE" in loss_type:
+        preds = torch.sigmoid(preds)
     val_kl = kl_div(preds, targets).item()
     val_mse = mse_fcn(preds, targets).item()
     val_pearson = pearson_loss(preds, targets).item()
@@ -343,6 +387,7 @@ for epoch in range(epochs):
     writer.add_scalar("val/KL_div", val_kl, epoch)
     writer.add_scalar("val/MSE", val_mse, epoch)
     writer.add_scalar("val/pearsonCC", val_pearson, epoch)
+
     
     # Save images:
     save_imgs = stack_img_pred_and_fix(inputs, targets, preds, loss_type)
@@ -369,12 +414,15 @@ for epoch in range(epochs):
         
         total_train_loss += loss.detach().item()
     
-    #pbar.set_postfix({"loss": total_train_loss / len(train_dl), "val_loss": val_loss})
+        pbar.set_postfix({"loss": loss.detach().item()})
     print("loss: ", round(total_train_loss / len(train_dl), 4), " val_loss: ", round(val_loss, 4))
     save(epoch, model, opt, val_loss, "newest_model.pt")
     if best_loss is None or val_loss <= best_loss:
         best_loss = val_loss
         save(epoch, model, opt, loss, "best_model.pt")
+        
+    loss_dict["train"].append(total_train_loss / len(train_dl))
+    loss_dict["val"].append(val_loss)
     
     # Change learning rate:
     scheduler.step(val_loss)
@@ -388,3 +436,54 @@ with torch.no_grad():
     imgs = torch.cat([model(sample["image"].to(device)) for sample in val_dl][:-1])
     torchvision.utils.save_image(imgs[:100], "imgs/final_val_preds.png", nrow=10)
       
+# Save test image predictions:
+test_folder = "test_preds/"
+os.makedirs(test_folder, exist_ok=True)
+with torch.no_grad():
+    for sample in test_dl:
+        img = sample["image"].to(device)
+        img_names = sample["img_name"]
+        preds = model(img).to("cpu").float()
+        if "BCE" in loss_type:
+            preds = torch.sigmoid(preds)
+        for idx, pred in enumerate(preds):
+            img_name = img_names[idx]
+            img_name = img_name[img_name.find("image-"):]
+            pred_name = "prediction" + img_name[5:]
+            torchvision.utils.save_image(pred, test_folder + pred_name)
+            
+# Save some test img predictions next to targets of best model:
+model.load_state_dict(torch.load("best_model.pt")["model"])
+model = model.to(device)
+model.eval()
+os.makedirs("imgs_test", exist_ok=True)
+inputs = []
+preds = []
+for val_sample in test_dl:
+    img = val_sample["image"].to(device)
+        
+    with torch.no_grad():
+        pred = model(img)
+    if "BCE" in loss_type:
+        pred = torch.sigmoid(pred)
+    preds.append(pred.to("cpu").float())
+    inputs.append(img.to("cpu").float())
+inputs = torch.cat(inputs)
+preds = torch.cat(preds)
+save_imgs = stack_img_pred_and_fix(inputs, None, preds, loss_type)
+torchvision.utils.save_image(save_imgs[:80], "imgs_test/" + "test_preds.png", nrow=8)
+
+
+# Plot losses:
+import matplotlib.pyplot as plt
+import seaborn as sns
+train_losses = loss_dict["train"]
+val_losses = loss_dict["val"]
+steps = range(len(train_losses))
+sns.lineplot(steps, train_losses, label="Train")
+sns.lineplot(steps, val_losses, label="Validation")
+plt.legend()
+plt.title("Losses during Training")
+plt.xlabel("Epochs")
+plt.ylabel("BCE Loss")
+plt.savefig("losses.pdf")
