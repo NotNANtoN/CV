@@ -8,39 +8,56 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, Dataset
 import torchvision
+from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 #import torchvision.models as models
-
-
-class MNIST_CNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.fc1 = nn.Linear(32 * 7 * 7, 120)
-        self.fc2 = nn.Linear(120, 10)
-
-    def forward(self, xb):
-        xb = xb.view(-1, 1, 28, 28)
-        xb = F.max_pool2d(F.ReLU(self.conv1(xb)), 2)
-        xb = F.max_pool2d(F.ReLU(self.conv2(xb)), 2)
-        xb = xb.view(-1, 32*7*7)
-        xb = F.ReLU(self.fc1(xb))
-        xb = self.fc2(xb)
-        return xb
     
+class Identity(nn.Module):
+    def __init__(self):
+        super(Identity, self).__init__()
+        
+    def forward(self, x):
+        return x
     
 class Encoder(nn.Module):
-    def __init__(self, pretrained=True):
+    def __init__(self, net_type, freeze, pretrained=True):
         super(Encoder, self).__init__()
         
-        # TODO: possibly freeze some or all of the weights here
+        self.net = net_type
         
-        # Get feature extractor of vgg16 but do not use last pooling layer:
-        self.feature_extractor = torchvision.models.vgg16(pretrained=pretrained).features[:-1] 
+        if self.net == "res":
+            self.feature_extractor = torchvision.models.resnet50(pretrained=pretrained)
+            print(self.feature_extractor)
+            self.feature_extractor.avgpool = Identity()
+            self.feature_extractor.fc = Identity()
+        elif self.net == "vgg":
+            # Get feature extractor of vgg16 but do not use last pooling layer:
+            self.feature_extractor = torchvision.models.vgg16(pretrained=pretrained).features[:-1] 
+            
+        if freeze == "all":
+            # Freeze params:
+            for parameter in self.feature_extractor.parameters():
+                parameter.requires_grad = False
+        elif freeze != "none":
+            n = int(freeze)
+            # Freeze some params:
+            for idx, parameter in enumerate(self.feature_extractor.named_parameters()):
+                parameter[1].requires_grad = False
+                if idx == n:
+                    break
+
+    def out_shape(self):
+        if self.net == "vgg":
+            # VGG:
+            return (512, 14)
+        elif self.net == "res":
+            # Resnet:
+            return (512, 14)
             
     def forward(self, x):
         features = self.feature_extractor(x)
+        if self.net == "res":
+            features = features.view(-1, 512, 14, 14)
         return features
     
 class Decoder(nn.Module):
@@ -50,6 +67,13 @@ class Decoder(nn.Module):
         in_channels, size = input_shp 
         
         #TODO: try upsample = nn.ConvTranspose2d(16, 16, 3, stride=2, padding=1 instead of Upsample
+        mode = "conv" # "bilinear", "conv"
+        
+        def create_upsampling(mode, channels):
+            if mode == "bilinear":
+                return nn.Upsample(scale_factor=2, mode="bilinear")
+            elif mode == "conv":
+                return nn.ConvTranspose2d(channels, channels, 2, stride=2, dilation=1, padding=0, output_padding=0)
         
         block1 = nn.Sequential(nn.Conv2d(in_channels, 512, 3, padding=1), 
                                nn.ReLU(),
@@ -57,7 +81,7 @@ class Decoder(nn.Module):
                                nn.ReLU(),
                                nn.Conv2d(512, 512, 3, padding=1),
                                nn.ReLU(),
-                               nn.Upsample(scale_factor=2, mode="bilinear")
+                               create_upsampling(mode, 512)
                               )
         block2 = nn.Sequential(nn.Conv2d(512, 512, 3, padding=1), 
                                nn.ReLU(),
@@ -65,7 +89,7 @@ class Decoder(nn.Module):
                                nn.ReLU(),
                                nn.Conv2d(512, 512, 3, padding=1),
                                nn.ReLU(),
-                               nn.Upsample(scale_factor=2, mode="bilinear")
+                               create_upsampling(mode, 512)
                               )
         block3 = nn.Sequential(nn.Conv2d(512, 256, 3, padding=1), 
                                nn.ReLU(),
@@ -73,13 +97,13 @@ class Decoder(nn.Module):
                                nn.ReLU(),
                                nn.Conv2d(256, 256, 3, padding=1),
                                nn.ReLU(),
-                               nn.Upsample(scale_factor=2, mode="bilinear")
+                               create_upsampling(mode, 256)
                               )
         block4 = nn.Sequential(nn.Conv2d(256, 128, 3, padding=1), 
                                nn.ReLU(),
                                nn.Conv2d(128, 128, 3, padding=1), 
                                nn.ReLU(),
-                               nn.Upsample(scale_factor=2, mode="bilinear")
+                               create_upsampling(mode, 128)
                               )
         block5 = nn.Sequential(nn.Conv2d(128, 512, 3, padding=1), 
                                nn.ReLU(),
@@ -89,17 +113,24 @@ class Decoder(nn.Module):
         self.generator = nn.Sequential(block1, block2, block3, block4, block5)
     
     def forward(self, x):
-        return self.generator(x)
+        x =  self.generator(x)
+        # Apply Sigmoid if we are evaluating the model, else the BCEWithLogitsLoss takes care of it:
+        #if not self.training:
+        #    x = torch.sigmoid(x)
+        return x
+
 
 class EncoderDecoder(nn.Module):
-    def __init__(self):
+    def __init__(self, net_type, freeze):
         super().__init__()
-        self.encoder = Encoder(pretrained=True)
-        self.decoder = Decoder((512, 14))
+        self.encoder = Encoder(net_type, freeze, pretrained=True)
+        embedding_shape = self.encoder.out_shape()
+        self.decoder = Decoder(embedding_shape)
         
     def forward(self, x):
         z = self.encoder(x)
         return self.decoder(z)
+    
     
 class BCELossDownsampling():
     def __init__(self):
@@ -109,6 +140,7 @@ class BCELossDownsampling():
     def __call__(self, pred, target):
         return self.loss_fcn(self.downsample(pred), self.downsample(target))
 
+    
 def read_file(filename):
 	lines = []
 	with open(filename, 'r') as file:
@@ -191,6 +223,33 @@ def save(epoch, model, opt, loss, path):
                 "optimizer": optimizer.state_dict(),
                 "loss": loss
                 }, path)
+    
+def stack_img_pred_and_fix(imgs, targets, preds, loss_type):
+    use_means = means.view(1, 3, 1, 1)
+    use_stds = stds.view(1, 3, 1, 1)
+    imgs = imgs.mul_(use_stds).add_(use_means) #* 255
+    if "BCE" in loss_type:
+        preds = torch.sigmoid(preds)
+    # turn to 3 channels:
+    preds = torch.cat([preds] * 3, dim=1)
+    targets = torch.cat([targets] * 3, dim=1)
+    # calc new shape:
+    shp = list(preds.shape)
+    shp[0] *= 3
+    # stack:
+    stacked = torch.stack([imgs, targets, preds], dim=1)
+    # reshape and return:
+    return stacked.view(shp)
+
+def pearson_loss(preds, targets):
+    x = preds
+    y = targets
+    vx = x - torch.mean(x)
+    vy = y - torch.mean(y)
+    cost = torch.mean(vx * vy) / (torch.sqrt(torch.mean(vx ** 2)) * torch.sqrt(torch.mean(vy ** 2)))
+    #cost = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)))
+    #cost = vx * vy * torch.rsqrt(torch.sum(vx ** 2)) * torch.rsqrt(torch.sum(vy ** 2)))
+    return (-1 * cost) + 1
             
 means = torch.tensor([0.485 , 0.456 , 0.406])
 stds = torch.tensor([0.229 , 0.224 , 0.225])
@@ -210,30 +269,84 @@ val_batch_size = 9
 train_dl = DataLoader(ds, batch_size=train_batch_size, num_workers=2, pin_memory=pin_mem, sampler=sampler)
 val_dl = DataLoader(val_ds, batch_size=val_batch_size, num_workers=2, pin_memory=pin_mem)
 
-#vgg16 = models.vgg16(pretrained=True)
-#print(vgg16)
-#for param in vgg16.parameters():
-#    param.requires_grad = False
-#num_feats = vgg16.fc.in_features
-#num_out_classes = 3
-#vgg16.fc = torch.nn.Linear(num_feats, num_out_classes)
-
+net_type = "vgg"  # "res", "vgg"
+freeze = "none" # "all", "N", "none"
+lr = 0.00003
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-model = EncoderDecoder()
+model = EncoderDecoder(net_type, freeze)
 model.to(device)
-opt = torch.optim.Adam(model.parameters(), lr=0.0003)
-loss_fcn = BCELossDownsampling()
+opt = torch.optim.Adam(model.parameters(), lr=lr)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.1, patience=3, verbose=True, threshold=0.0001, threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08)
+loss_type = "BCE+MSE"
+bce_fcn = torch.nn.BCEWithLogitsLoss() 
+kl_div_func = torch.nn.KLDivLoss()
+kl_div = lambda preds, targets: kl_div_func(torch.log(preds / preds.sum()), targets / targets.sum())
+mse_fcn = torch.nn.MSELoss()
+bce_down_fcn = BCELossDownsampling()
+if loss_type == "BCEDown":
+    loss_fcn = bce_down_fcn
+elif loss_type == "BCE":
+    loss_fcn = bce_fcn
+elif loss_type == "MSE":
+    loss_fcn = mse_fcn
+elif loss_type == "KL":
+    loss_fcn = kl_div
+elif loss_type == "pearson":
+    loss_fcn = pearson_loss
+elif loss_type == "KL+pearson":
+    loss_fcn = lambda x, y: pearson_loss(x, y) + kl_div(x, y)
+elif loss_type == "BCE+MSE":
+    loss_fcn = lambda x, y: bce_down_fcn(x, y) + mse_fcn(torch.sigmoid(x), y)
+
 os.makedirs("imgs", exist_ok=True)
 
 use_apex = True
 if use_apex:
     model, optimizer = amp.initialize(model, opt, opt_level="O1")
 
+writer = SummaryWriter(comment=loss_type + net_type + "freeze" + freeze + str(train_batch_size) + "_" + str(lr))
 epochs = 20
 pbar = tqdm(total=epochs * len(train_dl))
 best_loss = None
 for epoch in range(epochs):
+    
+                
+    # Eval:
+    model.eval()
+    inputs = []
+    preds = []
+    targets = []
+    for val_sample in val_dl:
+        img = val_sample["image"].to(device)
+        fix = val_sample["fixation"].to(device)
+        
+        with torch.no_grad():
+            pred = model(img)
+        targets.append(fix.to("cpu").float())
+        preds.append(pred.to("cpu").float())
+        inputs.append(img.to("cpu").float())
+    inputs = torch.cat(inputs)
+    preds = torch.cat(preds)
+    targets = torch.cat(targets)
+    
+    # Calc metrics:
+    val_bce = bce_fcn(preds, targets).item()
+    val_bce_down = bce_down_fcn(preds, targets).item()
+    val_loss = loss_fcn(preds, targets).item()
+    preds = torch.sigmoid(preds)
+    val_kl = kl_div(preds, targets).item()
+    val_mse = mse_fcn(preds, targets).item()
+    val_pearson = pearson_loss(preds, targets).item()
+    writer.add_scalar("val/BCE", val_bce, epoch)
+    writer.add_scalar("val/BCE_downsampled", val_bce_down, epoch)
+    writer.add_scalar("val/loss", val_loss, epoch)
+    writer.add_scalar("val/KL_div", val_kl, epoch)
+    writer.add_scalar("val/MSE", val_mse, epoch)
+    writer.add_scalar("val/pearsonCC", val_pearson, epoch)
+    
+    # Save images:
+    save_imgs = stack_img_pred_and_fix(inputs, targets, preds, loss_type)
+    torchvision.utils.save_image(save_imgs[:81], "imgs/" + str(epoch) + "_val_preds.png", nrow=9)
     
     model.train()
     total_train_loss = 0
@@ -242,6 +355,8 @@ for epoch in range(epochs):
         img, fixation = batch["image"].to(device), batch["fixation"].to(device)
         
         pred = model(img)
+        if "BCE" not in loss_type:
+            pred = torch.sigmoid(pred)
         loss = loss_fcn(pred, fixation)
         
         if use_apex:
@@ -253,49 +368,16 @@ for epoch in range(epochs):
         opt.zero_grad()
         
         total_train_loss += loss.detach().item()
-                
-    
-    model.eval()
-    with torch.no_grad():
-        val_loss = sum(loss_fcn(model(val_sample["image"].to(device)), val_sample["fixation"].to(device)) 
-                       for val_sample in val_dl) / len(val_dl) * val_batch_size
-        val_loss = val_loss.detach().item()
-        
-        # Save images:
-        def stack_img_pred_and_fix(sample):
-            use_means = means.view(1, 3, 1, 1)
-            use_stds = stds.view(1, 3, 1, 1)
-            img = sample["image"].mul_(use_stds).add_(use_means) #* 255
-            #img = ((sample["image"] * stds) + means) * 255
-            pred = model(img.to(device)).cpu()
-            # turn to 3 channel:
-            pred = torch.cat([pred] * 3, dim=1)
-            fix = sample["fixation"]
-            fix = torch.cat([fix] * 3, dim=1)
-            
-            
-            #img = sample["image"]
-            #pred = model(img.to(device)).cpu()
-            gray_img = img.mean(dim=1).unsqueeze(1)
-            #fix = sample["fixation"]
-            
-            #print(img.shape, pred.shape, gray_img.shape, fix.shape)
-            #return torch.cat([gray_img, pred, fix], dim=1)
-            shp = pred.shape
-            mod_shp = list(shp)
-            mod_shp[0] *= 3
-            stacked = torch.stack([img, pred, fix], dim=1)
-            #print(stacked.shape)
-            return stacked.view(mod_shp)
-        imgs = torch.cat([stack_img_pred_and_fix(sample) for sample in val_dl])
-        torchvision.utils.save_image(imgs[:100], "imgs/" + str(epoch) + "_val_preds.png", nrow=9)
     
     #pbar.set_postfix({"loss": total_train_loss / len(train_dl), "val_loss": val_loss})
-    print("loss: ", round(total_train_loss / len(train_dl) * train_batch_size, 2), " val_loss: ", round(val_loss, 2))
-    save(epoch, model, opt, loss, "newest_model.pt")
+    print("loss: ", round(total_train_loss / len(train_dl), 4), " val_loss: ", round(val_loss, 4))
+    save(epoch, model, opt, val_loss, "newest_model.pt")
     if best_loss is None or val_loss <= best_loss:
         best_loss = val_loss
         save(epoch, model, opt, loss, "best_model.pt")
+    
+    # Change learning rate:
+    scheduler.step(val_loss)
         
     
    
@@ -306,50 +388,3 @@ with torch.no_grad():
     imgs = torch.cat([model(sample["image"].to(device)) for sample in val_dl][:-1])
     torchvision.utils.save_image(imgs[:100], "imgs/final_val_preds.png", nrow=10)
       
-            
-            
-            
-quit()
-		
-		
-xtrain = torch.from_numpy(np.load("x_train.npy"))
-ytrain = torch.from_numpy(np.load("y_train.npy"))
-from torch.utils.data import TensorDataset
-trainds = TensorDataset(xtrain , ytrain)
-print("Size of dataset: ", len(trainds))
-# Get n ’ th  sample
-n = 1000
-x, y = trainds[n]
-# F i r s t  16  samples
-xb, yb = trainds[:16]
-print(xb.shape, yb.shape)
-# I t e r a t i n g  over  e n t i r e  d a t a s e t
-#for x, y in trainds:
-#    print(x.shape, y.shape)
-#    print(y)
-#    # do  something  with  sample  x ,  ypass
-
-net = MNIST_CNN()
-loss_fcn = F.cross_entropy
-opt = torch.optim.SGD(net.parameters(), lr=0.1)
-
-from torch.utils.data import DataLoader
-traindl = DataLoader(trainds , batch_size=16)
-epochs = 10
-for epoch in range(epochs):
-    
-    for xb, yb in traindl:
-        pbar.update(1)
-        pred = net(xb)
-        loss = loss_fcn(pred, yb)
-        print(loss)
-
-
-        loss.backward()
-        opt.step()
-        opt.zero_grad()
-    pbar.close()
-
-
-
-
