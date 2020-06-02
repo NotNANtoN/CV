@@ -1,3 +1,7 @@
+CV2/Project/imgs_test/
+CV2/Project/test_preds/
+*.zip
+CV2/Project/runs/
 week2/cifar10
 *data*
 *.pt
